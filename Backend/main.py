@@ -1,13 +1,12 @@
-# main.py (improvements)
 import os
 import uvicorn
 import tweepy
 import requests
 import time
 import asyncio
-from typing import Optional, Union
+from typing import Optional
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -37,12 +36,10 @@ AUTO_TWEET_SETTINGS = {
     "check_interval": 60,  # Check every 60 seconds for new transactions
     "min_amount_tao": 0,  # Tweet ALL transactions (including 0 TAO)
     "test_mode": False,  # Real tweets enabled - post to Twitter
-    "tweet_existing_on_startup": False,  # Disable startup tweeting to avoid rate limits
 }
 
-# Twitter API v2 client with OAuth 2.0
+# Twitter API client
 twitter_client = tweepy.Client(
-    bearer_token=None,  # We'll use OAuth 1.0a for now, but with v2 endpoints
     consumer_key=TWITTER_API_KEY,
     consumer_secret=TWITTER_API_SECRET,
     access_token=TWITTER_ACCESS_TOKEN,
@@ -50,40 +47,18 @@ twitter_client = tweepy.Client(
     wait_on_rate_limit=True
 )
 
-# Keep the old API for backward compatibility testing
-auth = tweepy.OAuth1UserHandler(
-    TWITTER_API_KEY, TWITTER_API_SECRET,
-    TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET
-)
-twitter_api = tweepy.API(auth)
-
 # Background task for monitoring
 monitoring_task = None
 
 def test_twitter_credentials():
     """Test Twitter API credentials"""
     try:
-        # Test API v2
-        print("🔍 Testing Twitter API v2 credentials...")
         response = twitter_client.get_me()
-        print(f"✅ API v2 works! Response: {response}")
+        print(f"✅ Twitter API works! Connected as: {response.data.username}")
         return True
     except Exception as e:
-        print(f"❌ API v2 failed: {e}")
-    
-    try:
-        # Test API v1.1
-        print("🔍 Testing Twitter API v1.1 credentials...")
-        me = twitter_api.verify_credentials()
-        if me:
-            print(f"✅ API v1.1 works! Connected as: @{me.screen_name}")
-            return True
-        else:
-            print("❌ API v1.1 failed: No user data returned")
-    except Exception as e:
-        print(f"❌ API v1.1 failed: {e}")
-    
-    return False
+        print(f"❌ Twitter API failed: {e}")
+        return False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -92,16 +67,14 @@ async def lifespan(app: FastAPI):
     # Startup
     if AUTO_TWEET_SETTINGS["enabled"]:
         print("🚀 Starting automatic Twitter monitoring...")
-        print(f"🔍 DEBUG: Current settings = {AUTO_TWEET_SETTINGS}")
         
         # Test Twitter credentials first
-        print("🔐 Testing Twitter API credentials...")
         if not test_twitter_credentials():
             print("⚠️ Twitter credentials test failed - tweets may not work!")
         
-        # Initialize with existing transactions (avoid tweeting on startup to prevent rate limits)
+        # Initialize with existing transactions
         try:
-            print("� Initializing with existing transactions...")
+            print("📊 Initializing with existing transactions...")
             data = get_all_transfers(API_KEY, ADDRESS, NETWORK)
             filtered, transfers_in, transfers_out = classify_transactions(data, TREASURY, ADDRESS)
             
@@ -110,37 +83,7 @@ async def lifespan(app: FastAPI):
             last_known_transactions["transfers_out"] = transfers_out.copy()
             last_known_transactions["last_check"] = datetime.now()
             
-            if AUTO_TWEET_SETTINGS.get("tweet_existing_on_startup", False):
-                print("📱 Tweeting about existing transactions...")
-                # Calculate daily totals once for all tweets
-                daily_totals = get_daily_transfer_totals(data)
-                
-                # Tweet about existing incoming transactions (reduce to 2 to be very conservative)
-                recent_in = transfers_in[:2] if len(transfers_in) > 2 else transfers_in
-                for i, tx in enumerate(recent_in):
-                    tweet_text = create_transaction_tweet(tx, "in", data, daily_totals)
-                    if tweet_text:
-                        print(f"🐦 Tweeting existing incoming transaction {i+1}/{len(recent_in)}...")
-                        post_tweet(tweet_text)
-                        await asyncio.sleep(10)  # Wait 10 seconds between tweets
-                
-                # Tweet about existing outgoing transactions (reduce to 2 to be very conservative)
-                recent_out = transfers_out[:2] if len(transfers_out) > 2 else transfers_out
-                for i, tx in enumerate(recent_out):
-                    tweet_text = create_transaction_tweet(tx, "out", data, daily_totals)
-                    if tweet_text:
-                        print(f"🐦 Tweeting existing outgoing transaction {i+1}/{len(recent_out)}...")
-                        post_tweet(tweet_text)
-                        await asyncio.sleep(10)  # Wait 10 seconds between tweets
-                
-                print(f"✅ Tweeted about {len(recent_in)} incoming and {len(recent_out)} outgoing transactions")
-            else:
-                print(f"✅ Initialized with {len(transfers_in)} incoming and {len(transfers_out)} outgoing transactions (startup tweeting disabled)")
-        except requests.exceptions.HTTPError as e:
-            if "429" in str(e):
-                print("⚠️ Rate limited during startup - will retry during normal operation")
-            else:
-                print(f"⚠️ Failed to initialize transactions: {e}")
+            print(f"✅ Initialized with {len(transfers_in)} incoming and {len(transfers_out)} outgoing transactions")
         except Exception as e:
             print(f"⚠️ Failed to initialize transactions: {e}")
         
@@ -280,14 +223,11 @@ async def track_transactions(api_key: str = API_KEY, address: str = ADDRESS, net
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
-# Post tweet using Twitter API v2 with rate limiting
 def post_tweet(tweet_text: str):
+    """Post tweet using Twitter API with rate limiting"""
     try:
-        print(f"🔍 DEBUG: test_mode setting = {AUTO_TWEET_SETTINGS.get('test_mode', False)}")
         if AUTO_TWEET_SETTINGS.get("test_mode", False):
-            # Test mode - don't actually post to Twitter
-            print(f"🧪 TEST MODE - Would post tweet:")
-            print(f"   📝 {tweet_text}")
+            print(f"🧪 TEST MODE - Would post tweet: {tweet_text[:100]}...")
             tweet_entry = {
                 "timestamp": datetime.now().isoformat(),
                 "status": "test_success",
@@ -295,31 +235,21 @@ def post_tweet(tweet_text: str):
                 "preview": tweet_text[:100] + "..." if len(tweet_text) > 100 else tweet_text
             }
         else:
-            # Try Twitter API v2 first
             try:
                 response = twitter_client.create_tweet(text=tweet_text)
-                tweet_id = None
-                # Handle tweepy v2 response format safely
-                try:
-                    tweet_id = getattr(getattr(response, 'data', {}), 'get', lambda x: None)('id')
-                except:
-                    try:
-                        tweet_id = getattr(response, 'id', None)
-                    except:
-                        tweet_id = None
+                tweet_id = response.data['id'] if response.data else None
                 
                 tweet_entry = {
                     "timestamp": datetime.now().isoformat(),
-                    "status": "success_v2",
+                    "status": "success",
                     "text": tweet_text,
                     "preview": tweet_text[:100] + "..." if len(tweet_text) > 100 else tweet_text,
                     "tweet_id": tweet_id
                 }
-                print(f"✅ Tweet posted successfully (API v2): {tweet_text[:50]}...")
-            except Exception as v2_error:
-                # Check if it's a rate limit error
-                if "429" in str(v2_error) or "rate limit" in str(v2_error).lower():
-                    print(f"🚫 Twitter rate limit reached, skipping tweet to avoid spam")
+                print(f"✅ Tweet posted successfully: {tweet_text[:50]}...")
+            except Exception as error:
+                if "429" in str(error) or "rate limit" in str(error).lower():
+                    print(f"🚫 Twitter rate limit reached, skipping tweet")
                     tweet_entry = {
                         "timestamp": datetime.now().isoformat(),
                         "status": "rate_limited",
@@ -328,31 +258,7 @@ def post_tweet(tweet_text: str):
                         "error": "Twitter rate limit reached"
                     }
                 else:
-                    # Try fallback to API v1.1 for other errors
-                    try:
-                        print(f"⚠️ API v2 failed, trying v1.1: {v2_error}")
-                        twitter_api.update_status(tweet_text)
-                        tweet_entry = {
-                            "timestamp": datetime.now().isoformat(),
-                            "status": "success_v1",
-                            "text": tweet_text,
-                            "preview": tweet_text[:100] + "..." if len(tweet_text) > 100 else tweet_text
-                        }
-                        print(f"✅ Tweet posted successfully (API v1.1): {tweet_text[:50]}...")
-                    except Exception as v1_error:
-                        # Both APIs failed
-                        if "429" in str(v1_error) or "rate limit" in str(v1_error).lower():
-                            print(f"🚫 Twitter rate limit reached on both APIs, skipping tweet")
-                            tweet_entry = {
-                                "timestamp": datetime.now().isoformat(),
-                                "status": "rate_limited",
-                                "text": tweet_text,
-                                "preview": tweet_text[:100] + "..." if len(tweet_text) > 100 else tweet_text,
-                                "error": "Twitter rate limit reached on both APIs"
-                            }
-                        else:
-                            raise v1_error
-                print(f"✅ Tweet posted successfully (API v1.1): {tweet_text[:50]}...")
+                    raise error
             
         tweet_history.append(tweet_entry)
         # Keep only last 20 tweets
@@ -368,7 +274,6 @@ def post_tweet(tweet_text: str):
             "preview": tweet_text[:100] + "..." if len(tweet_text) > 100 else tweet_text
         }
         tweet_history.append(tweet_entry)
-        # Keep only last 20 tweets
         if len(tweet_history) > 20:
             tweet_history.pop(0)
         print(f"❌ Failed to post tweet: {e}")
@@ -526,27 +431,7 @@ async def auto_tweet_new_transactions():
             # Calculate daily totals once for all tweets
             daily_totals = get_daily_transfer_totals(data)
             
-            # Tweet about existing transactions if no new ones found (for testing purposes)
-            if not new_in and not new_out and len(transfers_in) > 0 or len(transfers_out) > 0:
-                print("📱 No new transactions - tweeting about existing transactions for testing...")
-                
-                # Tweet about first 3 existing incoming transactions
-                existing_in = transfers_in[:3] if len(transfers_in) > 3 else transfers_in
-                for i, tx in enumerate(existing_in):
-                    tweet_text = create_transaction_tweet(tx, "in", data, daily_totals)
-                    if tweet_text:
-                        print(f"🐦 Tweeting existing incoming transaction {i+1}/{len(existing_in)}...")
-                        post_tweet(tweet_text)
-                        await asyncio.sleep(10)  # Wait 10 seconds between tweets
-                
-                # Tweet about first 3 existing outgoing transactions
-                existing_out = transfers_out[:3] if len(transfers_out) > 3 else transfers_out
-                for i, tx in enumerate(existing_out):
-                    tweet_text = create_transaction_tweet(tx, "out", data, daily_totals)
-                    if tweet_text:
-                        print(f"🐦 Tweeting existing outgoing transaction {i+1}/{len(existing_out)}...")
-                        post_tweet(tweet_text)
-                        await asyncio.sleep(10)  # Wait 10 seconds between tweets
+
             
             # Tweet new incoming transactions (if any)
             for i, tx in enumerate(new_in):
@@ -620,14 +505,13 @@ async def auto_tweet_history():
 
 @app.get("/auto-tweet/test-connection")
 async def test_twitter_connection_get():
-    """Test Twitter API connection (GET request) - just checks credentials"""
+    """Test Twitter API connection"""
     try:
-        # Test by getting user info instead of posting
-        user = twitter_api.verify_credentials()
+        response = twitter_client.get_me()
         return {
             "status": "success",
             "message": "Twitter API connection successful!",
-            "twitter_user": user.screen_name,
+            "twitter_user": response.data.username,
             "test_mode": AUTO_TWEET_SETTINGS.get("test_mode", False)
         }
     except Exception as e:
@@ -648,11 +532,12 @@ async def test_twitter_post():
                 "message": "Test mode enabled - would post: " + test_tweet
             }
         else:
-            twitter_api.update_status(test_tweet)
+            response = twitter_client.create_tweet(text=test_tweet)
             return {
                 "status": "success", 
                 "message": "Test tweet posted successfully!",
-                "tweet": test_tweet
+                "tweet": test_tweet,
+                "tweet_id": response.data['id'] if response.data else None
             }
     except Exception as e:
         return {
@@ -725,183 +610,9 @@ async def tweet_summary(background_tasks: BackgroundTasks, api_key: str = API_KE
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/auto-tweet/force-tweet-recent")
-async def force_tweet_recent_transactions():
-    """Force tweet about the most recent transactions for testing"""
-    try:
-        print("🔍 Forcing tweet about recent transactions...")
-        
-        # Get current transactions
-        data = get_all_transfers(API_KEY, ADDRESS, NETWORK)
-        filtered, transfers_in, transfers_out = classify_transactions(data, TREASURY, ADDRESS)
-        
-        tweets_sent = 0
-        
-        # Tweet about the most recent incoming transaction
-        if transfers_in:
-            recent_tx = transfers_in[0]  # Most recent
-            tweet_text = create_transaction_tweet(recent_tx, "in")
-            if tweet_text:
-                post_tweet(tweet_text)
-                tweets_sent += 1
-                print(f"🐦 Posted tweet about recent incoming transaction")
-        
-        # Tweet about the most recent outgoing transaction  
-        if transfers_out:
-            recent_tx = transfers_out[0]  # Most recent
-            tweet_text = create_transaction_tweet(recent_tx, "out")
-            if tweet_text:
-                post_tweet(tweet_text)
-                tweets_sent += 1
-                print(f"🐦 Posted tweet about recent outgoing transaction")
-        
-        return {
-            "status": "success",
-            "message": f"Force-tweeted {tweets_sent} recent transactions",
-            "tweets_sent": tweets_sent,
-            "total_transactions": {
-                "incoming": len(transfers_in),
-                "outgoing": len(transfers_out)
-            }
-        }
-        
-    except Exception as e:
-        return {
-            "status": "error", 
-            "message": f"Failed to force tweet: {str(e)}"
-        }
 
-@app.get("/twitter/test-credentials")
-async def test_twitter_credentials_endpoint():
-    """Test Twitter API credentials via endpoint"""
-    success = test_twitter_credentials()
-    return {
-        "credentials_valid": success,
-        "message": "Check server logs for detailed results"
-    }
 
-@app.post("/twitter/test-single-tweet")
-async def test_single_tweet():
-    """Post a single test tweet about the most recent transaction"""
-    try:
-        # Get most recent transaction
-        data = get_all_transfers(API_KEY, ADDRESS, NETWORK)
-        filtered, transfers_in, transfers_out = classify_transactions(data, TREASURY, ADDRESS)
-        
-        if not transfers_in and not transfers_out:
-            return {"error": "No transactions found"}
-        
-        # Get daily totals
-        daily_totals = get_daily_transfer_totals(data)
-        
-        # Use the most recent transaction (preferably one with 0 value for testing)
-        test_tx = None
-        if transfers_in:
-            # Look for a zero-value transaction first
-            for tx in transfers_in:
-                amount = round(int(tx.get('amount', 0)) / 1e9, 4) if tx.get('amount') else 0
-                if amount == 0:
-                    test_tx = tx
-                    direction = "in"
-                    break
-            
-            # If no zero-value, use the first one
-            if not test_tx:
-                test_tx = transfers_in[0]
-                direction = "in"
-        elif transfers_out:
-            # Look for a zero-value transaction first
-            for tx in transfers_out:
-                amount = round(int(tx.get('amount', 0)) / 1e9, 4) if tx.get('amount') else 0
-                if amount == 0:
-                    test_tx = tx
-                    direction = "out"
-                    break
-            
-            # If no zero-value, use the first one
-            if not test_tx:
-                test_tx = transfers_out[0]
-                direction = "out"
-        
-        if test_tx:
-            tweet_text = create_transaction_tweet(test_tx, direction, data, daily_totals)
-            if tweet_text:
-                post_tweet(tweet_text)
-                
-                amount = round(int(test_tx.get('amount', 0)) / 1e9, 4) if test_tx.get('amount') else 0
-                return {
-                    "success": True,
-                    "message": f"Test tweet posted for {amount} TAO transaction",
-                    "tweet_preview": tweet_text[:200] + "..." if len(tweet_text) > 200 else tweet_text,
-                    "direction": direction
-                }
-            else:
-                return {"error": "Failed to create tweet text"}
-        else:
-            return {"error": "No suitable transaction found"}
-            
-    except Exception as e:
-        return {"error": f"Failed to post test tweet: {str(e)}"}
 
-@app.post("/twitter/post-zero-transactions")
-async def post_zero_transactions():
-    """Post tweets about existing zero-value transactions"""
-    try:
-        # Get all transactions
-        data = get_all_transfers(API_KEY, ADDRESS, NETWORK)
-        filtered, transfers_in, transfers_out = classify_transactions(data, TREASURY, ADDRESS)
-        
-        # Get daily totals
-        daily_totals = get_daily_transfer_totals(data)
-        
-        tweets_posted = 0
-        
-        # Find and tweet zero-value incoming transactions (first 3)
-        zero_in = []
-        for tx in transfers_in:
-            amount = round(int(tx.get('amount', 0)) / 1e9, 4) if tx.get('amount') else 0
-            if amount == 0:
-                zero_in.append(tx)
-            if len(zero_in) >= 3:
-                break
-        
-        # Find and tweet zero-value outgoing transactions (first 3) 
-        zero_out = []
-        for tx in transfers_out:
-            amount = round(int(tx.get('amount', 0)) / 1e9, 4) if tx.get('amount') else 0
-            if amount == 0:
-                zero_out.append(tx)
-            if len(zero_out) >= 3:
-                break
-        
-        # Post tweets for zero-value incoming
-        for i, tx in enumerate(zero_in):
-            tweet_text = create_transaction_tweet(tx, "in", data, daily_totals)
-            if tweet_text:
-                post_tweet(tweet_text)
-                tweets_posted += 1
-                print(f"🐦 Posted zero-value incoming tweet {i+1}")
-                await asyncio.sleep(15)  # 15 seconds between tweets to be safe
-        
-        # Post tweets for zero-value outgoing
-        for i, tx in enumerate(zero_out):
-            tweet_text = create_transaction_tweet(tx, "out", data, daily_totals)
-            if tweet_text:
-                post_tweet(tweet_text)
-                tweets_posted += 1
-                print(f"🐦 Posted zero-value outgoing tweet {i+1}")
-                await asyncio.sleep(15)  # 15 seconds between tweets to be safe
-        
-        return {
-            "success": True,
-            "message": f"Posted {tweets_posted} zero-value transaction tweets",
-            "zero_incoming_found": len(zero_in),
-            "zero_outgoing_found": len(zero_out),
-            "tweets_posted": tweets_posted
-        }
-        
-    except Exception as e:
-        return {"error": f"Failed to post zero-value tweets: {str(e)}"}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
